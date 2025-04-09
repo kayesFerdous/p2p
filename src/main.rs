@@ -1,11 +1,13 @@
 use clap::Parser;
 use gub::cli::{Cli, Commands, GossipCommand};
+use gub::gossip_file::{join_gossip_room, open_gossip_room};
 use gub::receive::receive_file;
 use gub::send::send_file;
 
 use anyhow::Result;
 use iroh::{Endpoint, protocol::Router};
 use iroh_blobs::net_protocol::Blobs;
+use iroh_gossip::net::Gossip;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -14,11 +16,13 @@ async fn main() -> Result<()> {
     let endpoint = Endpoint::builder().discovery_n0().bind().await?;
     // We initialize the Blobs protocol in-memory
     let blobs = Blobs::memory().build(&endpoint);
+    let gossip = Gossip::builder().spawn(endpoint.clone()).await?;
 
     // Now we build a router that accepts blobs connections & routes them
     // to the blobs protocol.
     let router = Router::builder(endpoint)
         .accept(iroh_blobs::ALPN, blobs.clone())
+        .accept(iroh_gossip::ALPN, gossip.clone())
         .spawn()
         .await?;
 
@@ -34,8 +38,8 @@ async fn main() -> Result<()> {
             receive_file(&filename, &ticket, blobs_client).await?;
         }
         Commands::Gossip { name, command } => match command {
-            GossipCommand::Open => {}
-            GossipCommand::Join { ticket } => {}
+            GossipCommand::Open => open_gossip_room(name).await?,
+            GossipCommand::Join { ticket } => join_gossip_room(ticket, name).await?,
         },
     }
 
