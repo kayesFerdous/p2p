@@ -2,7 +2,7 @@ use anyhow::Result;
 use futures_lite::StreamExt;
 use iroh::{Endpoint, protocol::Router};
 use iroh::{NodeAddr, NodeId};
-use iroh_gossip::net::Gossip;
+use iroh_gossip::net::{Gossip, GossipSender};
 use iroh_gossip::{
     net::{Event, GossipEvent, GossipReceiver},
     proto::TopicId,
@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::io::BufRead;
 use std::str::FromStr;
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 
 use crate::clipboard::clipboard;
@@ -18,8 +19,15 @@ use crate::clipboard::clipboard;
 // Message enum (same as before)
 #[derive(Debug, Serialize, Deserialize)]
 enum Message {
-    AboutMe { from: NodeId, name: String },
-    Message { from: NodeId, text: String },
+    AboutMe {
+        from: NodeId,
+        name: String,
+    },
+    Message {
+        from: NodeId,
+        text: String,
+        timestamp: u64,
+    },
 }
 
 impl Message {
@@ -89,15 +97,20 @@ pub async fn open_gossip_room(name: Option<String>) -> Result<()> {
 
     let (sender, receiver) = gossip.subscribe_and_join(topic, vec![]).await?.split();
 
-    if let Some(name) = name {
+    if let Some(name) = name.clone() {
         let message = Message::AboutMe {
             from: endpoint.node_id(),
             name,
         };
         sender.broadcast(message.to_vec().into()).await?;
-    }
+    };
 
-    tokio::spawn(subscribe_loop(receiver));
+    tokio::spawn(subscribe_loop(
+        receiver,
+        endpoint.clone(),
+        name,
+        sender.clone(),
+    ));
 
     let (line_tx, mut line_rx) = mpsc::channel(1);
     std::thread::spawn(move || input_loop(line_tx));
@@ -108,6 +121,10 @@ pub async fn open_gossip_room(name: Option<String>) -> Result<()> {
         let message = Message::Message {
             from: endpoint.node_id(),
             text: text.clone(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
         };
         sender.broadcast(message.to_vec().into()).await?;
         println!("> Sent: {text}");
@@ -139,7 +156,7 @@ pub async fn join_gossip_room(ticket_str: String, name: Option<String>) -> Resul
 
     println!("> Connected to gossip topic.");
 
-    if let Some(name) = name {
+    if let Some(name) = name.clone() {
         let message = Message::AboutMe {
             from: endpoint.node_id(),
             name,
@@ -147,7 +164,12 @@ pub async fn join_gossip_room(ticket_str: String, name: Option<String>) -> Resul
         sender.broadcast(message.to_vec().into()).await?;
     }
 
-    tokio::spawn(subscribe_loop(receiver));
+    tokio::spawn(subscribe_loop(
+        receiver,
+        endpoint.clone(),
+        name,
+        sender.clone(),
+    ));
 
     let (line_tx, mut line_rx) = mpsc::channel(1);
     std::thread::spawn(move || input_loop(line_tx));
@@ -158,6 +180,10 @@ pub async fn join_gossip_room(ticket_str: String, name: Option<String>) -> Resul
         let message = Message::Message {
             from: endpoint.node_id(),
             text: text.clone(),
+            timestamp: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
         };
         sender.broadcast(message.to_vec().into()).await?;
         println!("> Sent: {text}");
@@ -167,24 +193,45 @@ pub async fn join_gossip_room(ticket_str: String, name: Option<String>) -> Resul
     Ok(())
 }
 
-async fn subscribe_loop(mut receiver: GossipReceiver) -> Result<()> {
+async fn subscribe_loop(
+    mut receiver: GossipReceiver,
+    endpoint: Endpoint,
+    my_name: Option<String>,
+    sender: GossipSender,
+) -> Result<()> {
     let mut names = HashMap::new();
 
     while let Some(event) = receiver.try_next().await? {
+        if let Event::Gossip(GossipEvent::NeighborUp(node_id)) = &event {
+            println!("got triggered by: {}", node_id);
+            let message = Message::AboutMe {
+                from: endpoint.node_id(),
+                name: match my_name.clone() {
+                    Some(name) => name,
+                    None => "Anonymous".to_string(),
+                },
+            };
+            sender.broadcast(message.to_vec().into()).await?;
+        };
+
         if let Event::Gossip(GossipEvent::Received(msg)) = event {
             match Message::from_bytes(&msg.content)? {
                 Message::AboutMe { from, name } => {
                     names.insert(from, name.clone());
                     println!("> {} is now known as {}", from.fmt_short(), name);
                 }
-                Message::Message { from, text } => {
+                Message::Message {
+                    from,
+                    text,
+                    timestamp: _,
+                } => {
                     let name = names
                         .get(&from)
                         .map_or_else(|| from.fmt_short(), String::to_string);
                     println!("{}: {}", name, text);
                 }
             }
-        }
+        };
     }
 
     Ok(())
@@ -196,6 +243,11 @@ fn input_loop(line_tx: mpsc::Sender<String>) -> Result<()> {
 
     for line in stdin_lock.lines() {
         let text = line?;
+        let time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        println!("{}", time);
         line_tx.blocking_send(text)?;
     }
 
